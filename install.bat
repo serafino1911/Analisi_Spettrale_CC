@@ -22,13 +22,62 @@ for /f "tokens=*" %%i in ('python --version 2^>nul') do (
     goto :python_found
 )
 
-echo [ERROR] Python 3.7+ not found in PATH
+echo [WARNING] Python 3.7+ not found in PATH
 echo.
-echo Please install Python from: https://www.python.org/downloads/windows/
-echo During installation, check "Add python.exe to PATH"
+set /p AUTO_INSTALL="Auto-install Python? (Y/N): "
+if /i "!AUTO_INSTALL!"=="N" (
+    echo.
+    echo Please install Python from: https://www.python.org/downloads/windows/
+    echo During installation, check "Add python.exe to PATH"
+    echo.
+    pause
+    exit /b 1
+)
+
+REM Try winget first (Windows 11 / recent Windows 10)
+winget install --id Python.Python.3.12 --quiet --accept-source-agreements 2>nul
+if !errorlevel! EQU 0 (
+    echo [OK] Python installed via winget
+    echo.
+    echo Restarting installer...
+    echo.
+    call "%~f0"
+    exit /b 0
+)
+
+REM Fallback: download and install using PowerShell
+echo [INFO] Downloading Python installer...
+powershell -NoProfile -Command ^
+    "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; " ^
+    "$url = 'https://www.python.org/ftp/python/3.12.3/python-3.12.3-amd64.exe'; " ^
+    "$outFile = Join-Path $PWD 'python-installer.exe'; " ^
+    "try { Invoke-WebRequest -Uri $url -OutFile $outFile -UseBasicParsing } " ^
+    "catch { Write-Host '[ERROR] Failed to download Python'; exit 1 }" 2>nul
+
+if not exist "python-installer.exe" (
+    echo [ERROR] Failed to download Python installer
+    echo.
+    echo Please download manually from: https://www.python.org/downloads/windows/
+    echo.
+    pause
+    exit /b 1
+)
+
+echo [INFO] Installing Python (this may take 2-3 minutes)...
+python-installer.exe /quiet InstallAllUsers=1 PrependPath=1 Include_doc=0 Include_tcltk=0
+if !errorlevel! NEQ 0 (
+    echo [ERROR] Python installation failed
+    del /q "python-installer.exe"
+    pause
+    exit /b 1
+)
+
+del /q "python-installer.exe"
+echo [OK] Python installed successfully
 echo.
-pause
-exit /b 1
+echo Restarting installer...
+call "%~f0"
+exit /b 0
 
 :python_found
 echo [OK] Python found: !PYTHON_VERSION!
