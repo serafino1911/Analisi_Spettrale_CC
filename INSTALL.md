@@ -4,6 +4,31 @@ This guide describes how to install and run the project, especially on Windows.
 
 ## Windows Installation (Recommended)
 
+### Method 1: Batch Script (No execution policy issues)
+
+1. Double-click `install.bat` in the project folder
+   
+   **OR** open Command Prompt and run:
+   ```batch
+   install.bat
+   ```
+
+2. The installer will:
+   - detect Python 3.7+ (`py -3` or `python`)
+   - create `.venv`
+   - install all packages from `requirements.txt`
+   - create `Analizzatore.bat`
+   - ensure the `results` folder exists
+
+3. Start the app with:
+   ```batch
+   Analizzatore.bat
+   ```
+
+`Analizzatore.bat` uses `.venv\Scripts\pythonw.exe` to launch `main.py` without a terminal window.
+
+### Method 2: PowerShell Script (Alternative)
+
 1. Open PowerShell in the project folder and run:
    ```powershell
    .\install.ps1
@@ -14,20 +39,6 @@ This guide describes how to install and run the project, especially on Windows.
    Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
    ```
    Then run `./install.ps1` again.
-
-3. The installer will:
-   - detect Python 3.7+ (`py -3` or `python`)
-   - create `.venv`
-   - install all packages from `requirements.txt`
-   - create `Analizzatore.bat`
-   - ensure the `results` folder exists
-
-4. Start the app with:
-   ```batch
-   Analizzatore.bat
-   ```
-
-`Analizzatore.bat` uses `.venv\Scripts\pythonw.exe` to launch `main.py` without a terminal window.
 
 ## Manual Installation (Windows)
 

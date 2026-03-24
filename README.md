@@ -33,8 +33,17 @@ Applicazione desktop in Python (PyQt5) per l’analisi di spettri da file CSV, c
 
 ## Installazione rapida (Windows consigliato)
 
-1. Apri PowerShell nella cartella del progetto.
-2. Esegui:
+### Metodo 1: Batch Script (consigliato, nessun problema di firma)
+
+1. Fai doppio-clic su `install.bat` oppure apri il prompt nella cartella e digita:
+
+```batch
+install.bat
+```
+
+### Metodo 2: PowerShell Script (alternativo)
+
+1. Apri PowerShell nella cartella del progetto e esegui:
 
 ```powershell
 .\install.ps1
@@ -117,6 +126,7 @@ La cartella di destinazione viene scelta dall’utente durante l’export.
 ```text
 Analisi_Spettrale_CC/
 ├── main.py
+├── install.bat
 ├── install.ps1
 ├── Analizzatore.bat
 ├── requirements.txt
@@ -128,8 +138,9 @@ Analisi_Spettrale_CC/
 
 ## Risoluzione problemi rapida
 
-- **Python non trovato**: installa Python da https://www.python.org/downloads/windows/ e abilita “Add python.exe to PATH”.
-- **Errore su dipendenze**: riesegui `install.ps1` oppure:
+- **Script bloccato da PowerShell**: usa `install.bat` invece di `install.ps1` (non ha problemi di firma).
+- **Python non trovato**: installa Python da https://www.python.org/downloads/windows/ e abilita "Add python.exe to PATH".
+- **Errore su dipendenze**: riesegui `install.bat` oppure:
 
 ```powershell
 & ".\.venv\Scripts\python.exe" -m pip install --upgrade -r requirements.txt
