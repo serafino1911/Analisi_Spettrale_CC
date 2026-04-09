@@ -8,6 +8,7 @@ from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
 from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import (
+    QAbstractItemView,
     QApplication,
     QCheckBox,
     QComboBox,
@@ -17,6 +18,8 @@ from PyQt5.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMessageBox,
     QPushButton,
@@ -62,6 +65,9 @@ class SpectraMainWindow(QMainWindow):
         self.dataset: SpectraDataset | None = None
         self.processed: ProcessedSpectra | None = None
         self.fits: dict[str, FitResult] = {}
+        self.cluster_plot_data = None
+        self.cluster_pick_map: dict[int, object] = {}
+        self.cluster_annotation = None
 
         self.tabs = QTabWidget()
         self.setCentralWidget(self.tabs)
@@ -69,9 +75,11 @@ class SpectraMainWindow(QMainWindow):
         self._build_preprocessing_tab()
         self._build_decomposition_tab()
         self._build_results_tab()
+        self._build_clustering_tab()
 
         self.tabs.setTabEnabled(1, False)
         self.tabs.setTabEnabled(2, False)
+        self.tabs.setTabEnabled(3, False)
         self.statusBar().showMessage("Select a file to start.")
 
     def _info_button(self, info_text: str) -> QToolButton:
@@ -380,6 +388,99 @@ class SpectraMainWindow(QMainWindow):
 
         self.tabs.addTab(tab, "3. Final Results")
 
+    def _build_clustering_tab(self) -> None:
+        tab = QWidget()
+        layout = QHBoxLayout(tab)
+
+        controls = QVBoxLayout()
+
+        view_group = QGroupBox("Peak Clustering View")
+        view_layout = QVBoxLayout(view_group)
+        view_layout.addWidget(
+            self._field_with_info(
+                "Spectra",
+                "Select one or more fitted spectra to compare their peak centers and relative intensities in a single graph.",
+            )
+        )
+
+        self.cluster_spectra_list = QListWidget()
+        self.cluster_spectra_list.setSelectionMode(QAbstractItemView.MultiSelection)
+        self.cluster_spectra_list.itemSelectionChanged.connect(self.on_update_clustering_plot)
+        view_layout.addWidget(self.cluster_spectra_list)
+
+        view_form = QFormLayout()
+        self.cluster_mode_combo = QComboBox()
+        self.cluster_mode_combo.addItem("Scatter only", userData="scatter")
+        self.cluster_mode_combo.addItem("Auto-group peaks", userData="clustered")
+        self.cluster_mode_combo.currentIndexChanged.connect(self.on_update_clustering_plot)
+
+        self.cluster_tolerance_spin = QDoubleSpinBox()
+        self.cluster_tolerance_spin.setRange(0.0001, 10_000.0)
+        self.cluster_tolerance_spin.setDecimals(4)
+        self.cluster_tolerance_spin.setValue(10.0)
+        self.cluster_tolerance_spin.valueChanged.connect(self.on_update_clustering_plot)
+
+        self.cluster_min_relative_spin = QDoubleSpinBox()
+        self.cluster_min_relative_spin.setRange(0.0, 1.0)
+        self.cluster_min_relative_spin.setDecimals(4)
+        self.cluster_min_relative_spin.setSingleStep(0.01)
+        self.cluster_min_relative_spin.setValue(0.0)
+        self.cluster_min_relative_spin.valueChanged.connect(self.on_update_clustering_plot)
+
+        view_form.addRow(
+            self._field_with_info("Display mode", "Choose whether to overlay all fitted peaks directly or group nearby center positions into peak clusters."),
+            self.cluster_mode_combo,
+        )
+        view_form.addRow(
+            self._field_with_info("Grouping tolerance", "Maximum distance in center position used to merge peaks into the same cluster when auto-grouping is enabled."),
+            self.cluster_tolerance_spin,
+        )
+        view_form.addRow(
+            self._field_with_info("Min relative intensity", "Ignore all peaks whose relative intensity is below this user-defined threshold (0 to 1)."),
+            self.cluster_min_relative_spin,
+        )
+        view_layout.addLayout(view_form)
+        controls.addWidget(view_group)
+
+        list_buttons = QHBoxLayout()
+        self.cluster_select_all_button = QPushButton("Select all")
+        self.cluster_select_all_button.clicked.connect(self.on_select_all_clustering_spectra)
+        self.cluster_clear_button = QPushButton("Clear selection")
+        self.cluster_clear_button.clicked.connect(self.on_clear_clustering_selection)
+        list_buttons.addWidget(self.cluster_select_all_button)
+        list_buttons.addWidget(self.cluster_clear_button)
+        controls.addLayout(list_buttons)
+
+        self.cluster_refresh_button = QPushButton("Refresh clustering plot")
+        self.cluster_refresh_button.clicked.connect(self.on_update_clustering_plot)
+        controls.addWidget(self.cluster_refresh_button)
+
+        export_buttons = QHBoxLayout()
+        self.cluster_export_image_button = QPushButton("Save image")
+        self.cluster_export_image_button.clicked.connect(self.on_save_clustering_image)
+        self.cluster_export_data_button = QPushButton("Export raw data")
+        self.cluster_export_data_button.clicked.connect(self.on_export_clustering_data)
+        export_buttons.addWidget(self.cluster_export_image_button)
+        export_buttons.addWidget(self.cluster_export_data_button)
+        controls.addLayout(export_buttons)
+
+        self.cluster_point_label = QLabel("Click a point in the graph to see the spectrum name and peak details.")
+        self.cluster_point_label.setWordWrap(True)
+        controls.addWidget(self.cluster_point_label)
+        controls.addStretch(1)
+
+        self.cluster_canvas = MplCanvas()
+        self.cluster_canvas.ax.set_title("Peak clustering")
+        self.cluster_canvas.ax.set_xlabel("Center position")
+        self.cluster_canvas.ax.set_ylabel("Relative intensity")
+        self.cluster_canvas.mpl_connect("pick_event", self.on_clustering_point_picked)
+
+        layout.addLayout(controls, 1)
+        layout.addWidget(self.cluster_canvas, 2)
+
+        self.tabs.addTab(tab, "4. Peak Clustering")
+        self._show_empty_clustering_message("Fit one or more spectra to populate the peak clustering view.")
+
     def on_filter_method_changed(self, _: int) -> None:
         method = self.filter_combo.currentData()
         self.fft_params_group.setVisible(method == "fft_lowpass")
@@ -401,7 +502,20 @@ class SpectraMainWindow(QMainWindow):
             combo.addItems(names)
             combo.blockSignals(False)
 
+        self._sync_clustering_spectrum_list(names)
         self.preview_spectrum_combo.setEnabled(True)
+
+    def _sync_clustering_spectrum_list(self, names: List[str]) -> None:
+        self.cluster_spectra_list.blockSignals(True)
+        self.cluster_spectra_list.clear()
+        for name in names:
+            item = QListWidgetItem(name)
+            self.cluster_spectra_list.addItem(item)
+            item.setSelected(True)
+        self.cluster_spectra_list.blockSignals(False)
+
+    def _selected_clustering_spectra(self) -> List[str]:
+        return [item.text() for item in self.cluster_spectra_list.selectedItems()]
 
     def on_select_file(self) -> None:
         file_path, _ = QFileDialog.getOpenFileName(
@@ -439,6 +553,8 @@ class SpectraMainWindow(QMainWindow):
         self.fits = {}
         self.tabs.setTabEnabled(1, False)
         self.tabs.setTabEnabled(2, False)
+        self.tabs.setTabEnabled(3, False)
+        self.on_update_clustering_plot()
 
         self.statusBar().showMessage("File loaded. Set X1/X2 and preview preprocessing.")
 
@@ -489,9 +605,12 @@ class SpectraMainWindow(QMainWindow):
             )
             self.fits = {}
             self.tabs.setTabEnabled(1, True)
+            self.tabs.setTabEnabled(2, False)
+            self.tabs.setTabEnabled(3, False)
             self.tabs.setCurrentIndex(1)
             self.statusBar().showMessage("Preprocessing confirmed. Decomposition unlocked.")
             self.on_detect_peaks()
+            self.on_update_clustering_plot()
         except Exception as exc:
             QMessageBox.warning(self, "Preprocessing error", str(exc))
 
@@ -654,6 +773,7 @@ class SpectraMainWindow(QMainWindow):
 
         self.fits[spectrum_name] = fit
         self.tabs.setTabEnabled(2, True)
+        self.tabs.setTabEnabled(3, True)
 
         progress.setLabelText("Rendering results...")
         progress.setValue(4)
@@ -677,6 +797,7 @@ class SpectraMainWindow(QMainWindow):
 
         self.statusBar().showMessage(f"Fitted spectrum: {spectrum_name}")
         self.on_update_results_plot()
+        self.on_update_clustering_plot()
 
         progress.setValue(5)
         progress.close()
@@ -749,7 +870,9 @@ class SpectraMainWindow(QMainWindow):
 
         if fit_count > 0:
             self.tabs.setTabEnabled(2, True)
+            self.tabs.setTabEnabled(3, True)
             self.on_update_results_plot()
+            self.on_update_clustering_plot()
 
         msg = f"Fit complete. Success: {fit_count}"
         if error_count:
@@ -793,6 +916,258 @@ class SpectraMainWindow(QMainWindow):
         self.results_canvas.ax.legend(loc="best", fontsize=8)
         self.results_canvas.draw()
 
+    def _show_empty_clustering_message(self, message: str) -> None:
+        self.cluster_plot_data = None
+        self.cluster_pick_map = {}
+        if self.cluster_annotation is not None:
+            try:
+                self.cluster_annotation.remove()
+            except Exception:
+                pass
+            self.cluster_annotation = None
+
+        self.cluster_canvas.ax.clear()
+        self.cluster_canvas.ax.set_title("Peak clustering")
+        self.cluster_canvas.ax.set_xlabel("Center position")
+        self.cluster_canvas.ax.set_ylabel("Relative intensity")
+        self.cluster_canvas.ax.text(
+            0.5,
+            0.5,
+            message,
+            ha="center",
+            va="center",
+            wrap=True,
+            transform=self.cluster_canvas.ax.transAxes,
+        )
+        self.cluster_point_label.setText("Click a point in the graph to see the spectrum name and peak details.")
+        self.cluster_canvas.draw()
+
+    def on_select_all_clustering_spectra(self) -> None:
+        self.cluster_spectra_list.blockSignals(True)
+        for row in range(self.cluster_spectra_list.count()):
+            item = self.cluster_spectra_list.item(row)
+            if item is not None:
+                item.setSelected(True)
+        self.cluster_spectra_list.blockSignals(False)
+        self.on_update_clustering_plot()
+
+    def on_clear_clustering_selection(self) -> None:
+        self.cluster_spectra_list.clearSelection()
+        self.on_update_clustering_plot()
+
+    def on_save_clustering_image(self) -> None:
+        default_dir = os.path.dirname(self.dataset.file_path) if self.dataset is not None else ""
+        default_path = os.path.join(default_dir, "peak_clustering.png") if default_dir else "peak_clustering.png"
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save clustering image",
+            default_path,
+            "PNG Image (*.png);;PDF File (*.pdf);;SVG File (*.svg)",
+        )
+        if not file_path:
+            return
+
+        try:
+            self.cluster_canvas.figure.savefig(file_path, dpi=300, bbox_inches="tight")
+        except Exception as exc:
+            QMessageBox.warning(self, "Save image error", str(exc))
+            return
+
+        self.statusBar().showMessage(f"Clustering image saved: {file_path}")
+
+    def on_export_clustering_data(self) -> None:
+        if self.cluster_plot_data is None or len(self.cluster_plot_data) == 0:
+            self.on_update_clustering_plot()
+
+        if self.cluster_plot_data is None or len(self.cluster_plot_data) == 0:
+            QMessageBox.warning(self, "Export error", "No clustering data is currently available to export.")
+            return
+
+        default_dir = os.path.dirname(self.dataset.file_path) if self.dataset is not None else ""
+        default_path = os.path.join(default_dir, "peak_clustering_data.csv") if default_dir else "peak_clustering_data.csv"
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export clustering data",
+            default_path,
+            "CSV files (*.csv);;All files (*.*)",
+        )
+        if not file_path:
+            return
+
+        try:
+            export_df = self.cluster_plot_data.copy()
+            numeric_cols = export_df.select_dtypes(include=[np.number]).columns
+            if len(numeric_cols) > 0:
+                export_df.loc[:, numeric_cols] = export_df.loc[:, numeric_cols].mask(export_df.loc[:, numeric_cols].abs() < 1e-12, 0.0)
+            export_df.to_csv(file_path, index=False)
+        except Exception as exc:
+            QMessageBox.warning(self, "Export error", str(exc))
+            return
+
+        self.statusBar().showMessage(f"Clustering raw data exported: {file_path}")
+
+    def on_clustering_point_picked(self, event) -> None:
+        point_df = self.cluster_pick_map.get(id(event.artist))
+        if point_df is None or len(getattr(event, "ind", [])) == 0:
+            return
+
+        row = point_df.iloc[int(event.ind[0])]
+        center = float(row["Center"])
+        rel_intensity = float(row["Relative_Intensity"])
+        spectrum_name = str(row["Spectrum"])
+        peak_n = int(row["Peak_N"])
+        cluster_text = ""
+        if "Cluster" in row.index:
+            cluster_text = f"\nCluster: {int(row['Cluster'])}"
+
+        if self.cluster_annotation is not None:
+            try:
+                self.cluster_annotation.remove()
+            except Exception:
+                pass
+
+        self.cluster_annotation = self.cluster_canvas.ax.annotate(
+            f"Spectrum: {spectrum_name}\nPeak: {peak_n}\nCenter: {center:.6g}\nRelative intensity: {rel_intensity:.4f}{cluster_text}",
+            xy=(center, rel_intensity),
+            xytext=(12, 12),
+            textcoords="offset points",
+            bbox={"boxstyle": "round", "fc": "white", "ec": "0.5", "alpha": 0.95},
+            arrowprops={"arrowstyle": "->", "color": "0.35"},
+        )
+        self.cluster_point_label.setText(
+            f"Selected spectrum: {spectrum_name} | Peak {peak_n} | Center {center:.6g} | Relative intensity {rel_intensity:.4f}"
+        )
+        self.cluster_canvas.draw_idle()
+        self.statusBar().showMessage(f"Selected point from spectrum: {spectrum_name}")
+
+    def _cluster_ids_from_centers(self, centers: np.ndarray, tolerance: float) -> np.ndarray:
+        if centers.size == 0:
+            return np.array([], dtype=int)
+
+        tolerance = max(float(tolerance), 1e-9)
+        order = np.argsort(centers)
+        cluster_ids = np.zeros(centers.size, dtype=int)
+        current_cluster = 0
+        cluster_sum = 0.0
+        cluster_size = 0
+
+        for idx in order:
+            center = float(centers[idx])
+            if cluster_size == 0:
+                current_cluster = 1
+                cluster_sum = center
+                cluster_size = 1
+                cluster_ids[idx] = current_cluster
+                continue
+
+            cluster_mean = cluster_sum / cluster_size
+            if abs(center - cluster_mean) <= tolerance:
+                cluster_sum += center
+                cluster_size += 1
+            else:
+                current_cluster += 1
+                cluster_sum = center
+                cluster_size = 1
+            cluster_ids[idx] = current_cluster
+
+        return cluster_ids
+
+    def on_update_clustering_plot(self) -> None:
+        if self.processed is None or not self.fits:
+            self._show_empty_clustering_message("Fit one or more spectra to populate the peak clustering view.")
+            return
+
+        selected_spectra = self._selected_clustering_spectra()
+        if not selected_spectra:
+            self._show_empty_clustering_message("Select one or more spectra to compare their fitted peaks.")
+            return
+
+        summary = peaks_summary_dataframe(self.fits)
+        if summary.empty:
+            self._show_empty_clustering_message("No fitted peaks are available for the selected spectra.")
+            return
+
+        summary = summary[summary["Spectrum"].isin(selected_spectra)].copy()
+        if summary.empty:
+            self._show_empty_clustering_message("The selected spectra have not been fitted yet.")
+            return
+
+        relative_intensities = []
+        for spectrum_name, amplitude in zip(summary["Spectrum"], summary["Amplitude"]):
+            spectrum_max = max(float(np.max(np.abs(self.processed.filtered[str(spectrum_name)]))), 1e-12)
+            relative_intensities.append(float(np.clip(float(amplitude) / spectrum_max, 0.0, 1.0)))
+        summary["Relative_Intensity"] = relative_intensities
+
+        min_relative_intensity = float(self.cluster_min_relative_spin.value())
+        summary = summary[summary["Relative_Intensity"] >= min_relative_intensity].copy()
+        if summary.empty:
+            self._show_empty_clustering_message(
+                f"No peaks remain after applying the relative-intensity threshold ({min_relative_intensity:.4f})."
+            )
+            return
+
+        mode = self.cluster_mode_combo.currentData()
+        self.cluster_tolerance_spin.setEnabled(mode == "clustered")
+
+        if self.cluster_annotation is not None:
+            try:
+                self.cluster_annotation.remove()
+            except Exception:
+                pass
+            self.cluster_annotation = None
+
+        self.cluster_plot_data = None
+        self.cluster_pick_map = {}
+        self.cluster_point_label.setText("Click a point in the graph to see the spectrum name and peak details.")
+
+        ax = self.cluster_canvas.ax
+        ax.clear()
+
+        if mode == "clustered":
+            cluster_ids = self._cluster_ids_from_centers(
+                summary["Center"].to_numpy(dtype=float),
+                float(self.cluster_tolerance_spin.value()),
+            )
+            summary["Cluster"] = cluster_ids
+            for cluster_id, cluster_df in summary.groupby("Cluster", sort=True):
+                mean_center = float(cluster_df["Center"].mean())
+                scatter = ax.scatter(
+                    cluster_df["Center"],
+                    cluster_df["Relative_Intensity"],
+                    s=60,
+                    alpha=0.85,
+                    label=f"Cluster {cluster_id} (~{mean_center:.3g})",
+                    picker=True,
+                )
+                self.cluster_pick_map[id(scatter)] = cluster_df.reset_index(drop=True)
+                ax.axvline(mean_center, color="0.85", linestyle=":", linewidth=0.8)
+            title = f"Peak clustering across {summary['Spectrum'].nunique()} spectra"
+        else:
+            for spectrum_name, spectrum_df in summary.groupby("Spectrum", sort=False):
+                scatter = ax.scatter(
+                    spectrum_df["Center"],
+                    spectrum_df["Relative_Intensity"],
+                    s=60,
+                    alpha=0.85,
+                    label=str(spectrum_name),
+                    picker=True,
+                )
+                self.cluster_pick_map[id(scatter)] = spectrum_df.reset_index(drop=True)
+            title = f"Peak positions across {summary['Spectrum'].nunique()} spectra"
+
+        self.cluster_plot_data = summary.reset_index(drop=True)
+
+        ax.set_title(title)
+        ax.set_xlabel("Center position")
+        ax.set_ylabel("Relative intensity")
+        ax.set_ylim(0.0, 1.05)
+        ax.grid(True, alpha=0.25)
+        ax.legend(loc="best", fontsize=8)
+        self.cluster_canvas.draw()
+
+        self.statusBar().showMessage(
+            f"Clustering view updated: {len(summary)} peaks from {summary['Spectrum'].nunique()} spectra with relative intensity >= {min_relative_intensity:.4f}."
+        )
     def on_export_results(self) -> None:
         if self.dataset is None or self.processed is None:
             QMessageBox.warning(self, "Export error", "Load and preprocess data before exporting.")
