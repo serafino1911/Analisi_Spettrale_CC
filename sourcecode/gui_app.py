@@ -66,6 +66,7 @@ class SpectraMainWindow(QMainWindow):
         self.processed: ProcessedSpectra | None = None
         self.fits: dict[str, FitResult] = {}
         self.cluster_plot_data = None
+        self.cluster_summary_data = None
         self.cluster_pick_map: dict[int, object] = {}
         self.cluster_annotation = None
 
@@ -918,6 +919,7 @@ class SpectraMainWindow(QMainWindow):
 
     def _show_empty_clustering_message(self, message: str) -> None:
         self.cluster_plot_data = None
+        self.cluster_summary_data = None
         self.cluster_pick_map = {}
         if self.cluster_annotation is not None:
             try:
@@ -996,15 +998,46 @@ class SpectraMainWindow(QMainWindow):
 
         try:
             export_df = self.cluster_plot_data.copy()
+            preferred_order = [
+                "Point_ID",
+                "Spectrum",
+                "Peak_N",
+                "Model",
+                "Center",
+                "Amplitude",
+                "Relative_Intensity",
+                "Area",
+                "Width",
+                "Width_Left",
+                "Width_Right",
+                "Skew",
+                "Cluster_ID",
+                "Cluster_Label",
+                "Cluster_Position",
+                "Cluster_Population",
+                "Cluster_Width",
+            ]
+            ordered_cols = [col for col in preferred_order if col in export_df.columns]
+            remaining_cols = [col for col in export_df.columns if col not in ordered_cols]
+            export_df = export_df.loc[:, ordered_cols + remaining_cols]
+
             numeric_cols = export_df.select_dtypes(include=[np.number]).columns
             if len(numeric_cols) > 0:
                 export_df.loc[:, numeric_cols] = export_df.loc[:, numeric_cols].mask(export_df.loc[:, numeric_cols].abs() < 1e-12, 0.0)
             export_df.to_csv(file_path, index=False)
+
+            summary_path = None
+            if self.cluster_summary_data is not None and len(self.cluster_summary_data) > 0:
+                summary_path = os.path.splitext(file_path)[0] + "_cluster_summary.csv"
+                self.cluster_summary_data.to_csv(summary_path, index=False)
         except Exception as exc:
             QMessageBox.warning(self, "Export error", str(exc))
             return
 
-        self.statusBar().showMessage(f"Clustering raw data exported: {file_path}")
+        msg = f"Clustering raw data exported: {file_path}"
+        if summary_path is not None:
+            msg += f" | Cluster summary: {summary_path}"
+        self.statusBar().showMessage(msg)
 
     def on_clustering_point_picked(self, event) -> None:
         point_df = self.cluster_pick_map.get(id(event.artist))
@@ -1016,9 +1049,23 @@ class SpectraMainWindow(QMainWindow):
         rel_intensity = float(row["Relative_Intensity"])
         spectrum_name = str(row["Spectrum"])
         peak_n = int(row["Peak_N"])
+        point_id = int(row["Point_ID"]) if "Point_ID" in row.index else peak_n
+
         cluster_text = ""
-        if "Cluster" in row.index:
-            cluster_text = f"\nCluster: {int(row['Cluster'])}"
+        cluster_label = ""
+        if "Cluster_ID" in row.index:
+            cluster_id = int(row["Cluster_ID"])
+            cluster_position = float(row.get("Cluster_Position", center))
+            cluster_population = int(row.get("Cluster_Population", 1))
+            cluster_width = float(row.get("Cluster_Width", row.get("Width", 0.0)))
+            cluster_label = f" | Cluster {cluster_id}"
+            cluster_text = (
+                f"\nPoint ID: {point_id}"
+                f"\nCluster ID: {cluster_id}"
+                f"\nCluster position: {cluster_position:.6g}"
+                f"\nCluster population: {cluster_population}"
+                f"\nCluster width: {cluster_width:.6g}"
+            )
 
         if self.cluster_annotation is not None:
             try:
@@ -1035,7 +1082,7 @@ class SpectraMainWindow(QMainWindow):
             arrowprops={"arrowstyle": "->", "color": "0.35"},
         )
         self.cluster_point_label.setText(
-            f"Selected spectrum: {spectrum_name} | Peak {peak_n} | Center {center:.6g} | Relative intensity {rel_intensity:.4f}"
+            f"Selected spectrum: {spectrum_name} | Point ID {point_id} | Peak {peak_n}{cluster_label} | Center {center:.6g} | Relative intensity {rel_intensity:.4f}"
         )
         self.cluster_canvas.draw_idle()
         self.statusBar().showMessage(f"Selected point from spectrum: {spectrum_name}")
@@ -1071,6 +1118,28 @@ class SpectraMainWindow(QMainWindow):
             cluster_ids[idx] = current_cluster
 
         return cluster_ids
+
+    def _attach_cluster_metadata(self, summary):
+        summary = summary.copy().reset_index(drop=True)
+        summary["Point_ID"] = np.arange(1, len(summary) + 1, dtype=int)
+        summary["Cluster_ID"] = self._cluster_ids_from_centers(
+            summary["Center"].to_numpy(dtype=float),
+            float(self.cluster_tolerance_spin.value()),
+        )
+
+        cluster_summary = (
+            summary.groupby("Cluster_ID", sort=True)
+            .agg(
+                Cluster_Position=("Center", "mean"),
+                Cluster_Population=("Center", "size"),
+                Cluster_Width=("Width", "mean"),
+            )
+            .reset_index()
+        )
+        cluster_summary["Cluster_Label"] = cluster_summary["Cluster_ID"].map(lambda cid: f"Cluster {int(cid)}")
+
+        summary = summary.merge(cluster_summary, on="Cluster_ID", how="left")
+        return summary, cluster_summary
 
     def on_update_clustering_plot(self) -> None:
         if self.processed is None or not self.fits:
@@ -1117,30 +1186,29 @@ class SpectraMainWindow(QMainWindow):
             self.cluster_annotation = None
 
         self.cluster_plot_data = None
+        self.cluster_summary_data = None
         self.cluster_pick_map = {}
         self.cluster_point_label.setText("Click a point in the graph to see the spectrum name and peak details.")
+
+        summary, cluster_summary = self._attach_cluster_metadata(summary)
 
         ax = self.cluster_canvas.ax
         ax.clear()
 
         if mode == "clustered":
-            cluster_ids = self._cluster_ids_from_centers(
-                summary["Center"].to_numpy(dtype=float),
-                float(self.cluster_tolerance_spin.value()),
-            )
-            summary["Cluster"] = cluster_ids
-            for cluster_id, cluster_df in summary.groupby("Cluster", sort=True):
-                mean_center = float(cluster_df["Center"].mean())
+            for cluster_id, cluster_df in summary.groupby("Cluster_ID", sort=True):
+                cluster_position = float(cluster_df["Cluster_Position"].iloc[0])
+                cluster_population = int(cluster_df["Cluster_Population"].iloc[0])
                 scatter = ax.scatter(
                     cluster_df["Center"],
                     cluster_df["Relative_Intensity"],
                     s=60,
                     alpha=0.85,
-                    label=f"Cluster {cluster_id} (~{mean_center:.3g})",
+                    label=f"Cluster {cluster_id} (pos {cluster_position:.3g}, n={cluster_population})",
                     picker=True,
                 )
                 self.cluster_pick_map[id(scatter)] = cluster_df.reset_index(drop=True)
-                ax.axvline(mean_center, color="0.85", linestyle=":", linewidth=0.8)
+                ax.axvline(cluster_position, color="0.85", linestyle=":", linewidth=0.8)
             title = f"Peak clustering across {summary['Spectrum'].nunique()} spectra"
         else:
             for spectrum_name, spectrum_df in summary.groupby("Spectrum", sort=False):
@@ -1156,6 +1224,7 @@ class SpectraMainWindow(QMainWindow):
             title = f"Peak positions across {summary['Spectrum'].nunique()} spectra"
 
         self.cluster_plot_data = summary.reset_index(drop=True)
+        self.cluster_summary_data = cluster_summary.reset_index(drop=True)
 
         ax.set_title(title)
         ax.set_xlabel("Center position")
