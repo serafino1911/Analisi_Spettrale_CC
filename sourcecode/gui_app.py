@@ -4,6 +4,7 @@ import os
 from typing import List, Tuple
 
 import numpy as np
+import pandas as pd
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
 from PyQt5.QtCore import Qt
@@ -42,6 +43,8 @@ from sourcecode.spectra_math import (
     expand_peaks_for_hidden_doublets,
     expand_peaks_with_derivative_mode,
     expand_peaks_with_local_aic,
+    expand_peaks_with_plateau_edges,
+    expand_peaks_with_plateau_morphology,
     fit_spectrum,
     load_spectra_csv,
     peaks_summary_dataframe,
@@ -65,6 +68,7 @@ class SpectraMainWindow(QMainWindow):
         self.dataset: SpectraDataset | None = None
         self.processed: ProcessedSpectra | None = None
         self.fits: dict[str, FitResult] = {}
+        self.detected_peaks: dict[str, List[Tuple[float, float, float]]] = {}
         self.cluster_plot_data = None
         self.cluster_summary_data = None
         self.cluster_pick_map: dict[int, object] = {}
@@ -257,6 +261,8 @@ class SpectraMainWindow(QMainWindow):
         self.hidden_peak_mode_combo.addItem("Heuristic split", userData="heuristic")
         self.hidden_peak_mode_combo.addItem("Derivative (slope + 2nd deriv)", userData="derivative")
         self.hidden_peak_mode_combo.addItem("Local AIC (1 vs 2)", userData="aic_local")
+        self.hidden_peak_mode_combo.addItem("Plateau edges", userData="plateau_edges")
+        self.hidden_peak_mode_combo.addItem("Plateau morphology", userData="plateau_morph")
         self.hidden_peak_mode_combo.setCurrentIndex(2)
 
         self.split_factor_spin = QDoubleSpinBox()
@@ -304,11 +310,14 @@ class SpectraMainWindow(QMainWindow):
         button_row = QHBoxLayout()
         self.detect_button = QPushButton("Detect Peaks")
         self.detect_button.clicked.connect(self.on_detect_peaks)
+        self.detect_all_button = QPushButton("Detect all Peaks")
+        self.detect_all_button.clicked.connect(self.on_detect_all_peaks)
         self.fit_selected_button = QPushButton("Fit this spectrum")
         self.fit_selected_button.clicked.connect(self.on_fit_selected)
         self.fit_all_button = QPushButton("Fit ALL spectra")
         self.fit_all_button.clicked.connect(self.on_fit_all)
         button_row.addWidget(self.detect_button)
+        button_row.addWidget(self.detect_all_button)
         button_row.addWidget(self.fit_selected_button)
         button_row.addWidget(self.fit_all_button)
         controls.addLayout(button_row)
@@ -400,7 +409,7 @@ class SpectraMainWindow(QMainWindow):
         view_layout.addWidget(
             self._field_with_info(
                 "Spectra",
-                "Select one or more fitted spectra to compare their peak centers and relative intensities in a single graph.",
+                "Select one or more spectra to compare their detected or fitted peak centers and relative intensities in a single graph.",
             )
         )
 
@@ -410,6 +419,11 @@ class SpectraMainWindow(QMainWindow):
         view_layout.addWidget(self.cluster_spectra_list)
 
         view_form = QFormLayout()
+        self.cluster_source_combo = QComboBox()
+        self.cluster_source_combo.addItem("Fitted peaks", userData="fitted")
+        self.cluster_source_combo.addItem("Detected peaks", userData="detected")
+        self.cluster_source_combo.currentIndexChanged.connect(self.on_update_clustering_plot)
+
         self.cluster_mode_combo = QComboBox()
         self.cluster_mode_combo.addItem("Scatter only", userData="scatter")
         self.cluster_mode_combo.addItem("Auto-group peaks", userData="clustered")
@@ -428,6 +442,10 @@ class SpectraMainWindow(QMainWindow):
         self.cluster_min_relative_spin.setValue(0.0)
         self.cluster_min_relative_spin.valueChanged.connect(self.on_update_clustering_plot)
 
+        view_form.addRow(
+            self._field_with_info("Peak source", "Choose whether to cluster fitted peaks or detected peaks."),
+            self.cluster_source_combo,
+        )
         view_form.addRow(
             self._field_with_info("Display mode", "Choose whether to overlay all fitted peaks directly or group nearby center positions into peak clusters."),
             self.cluster_mode_combo,
@@ -480,7 +498,7 @@ class SpectraMainWindow(QMainWindow):
         layout.addWidget(self.cluster_canvas, 2)
 
         self.tabs.addTab(tab, "4. Peak Clustering")
-        self._show_empty_clustering_message("Fit one or more spectra to populate the peak clustering view.")
+        self._show_empty_clustering_message("Detect or fit peaks to populate the peak clustering view.")
 
     def on_filter_method_changed(self, _: int) -> None:
         method = self.filter_combo.currentData()
@@ -552,6 +570,10 @@ class SpectraMainWindow(QMainWindow):
 
         self.processed = None
         self.fits = {}
+        self.detected_peaks = {}
+        self.cluster_source_combo.blockSignals(True)
+        self.cluster_source_combo.setCurrentIndex(0)
+        self.cluster_source_combo.blockSignals(False)
         self.tabs.setTabEnabled(1, False)
         self.tabs.setTabEnabled(2, False)
         self.tabs.setTabEnabled(3, False)
@@ -605,6 +627,10 @@ class SpectraMainWindow(QMainWindow):
                 filter_params=params,
             )
             self.fits = {}
+            self.detected_peaks = {}
+            self.cluster_source_combo.blockSignals(True)
+            self.cluster_source_combo.setCurrentIndex(0)
+            self.cluster_source_combo.blockSignals(False)
             self.tabs.setTabEnabled(1, True)
             self.tabs.setTabEnabled(2, False)
             self.tabs.setTabEnabled(3, False)
@@ -642,6 +668,55 @@ class SpectraMainWindow(QMainWindow):
             peaks.append((center, amp, width))
         return peaks
 
+    def _expand_hidden_peaks(
+        self,
+        x: np.ndarray,
+        y: np.ndarray,
+        peaks: List[Tuple[float, float, float]],
+        model: str,
+        skew_limit: float,
+    ) -> List[Tuple[float, float, float]]:
+        hidden_mode = self.hidden_peak_mode_combo.currentData()
+        if hidden_mode == "heuristic":
+            return expand_peaks_for_hidden_doublets(
+                peaks,
+                x_min=float(np.min(x)),
+                x_max=float(np.max(x)),
+                split_factor=float(self.split_factor_spin.value()),
+                max_subpeaks_per_peak=2,
+            )
+        if hidden_mode == "derivative":
+            return expand_peaks_with_derivative_mode(
+                x,
+                y,
+                peaks,
+                window_factor=float(self.split_factor_spin.value()),
+            )
+        if hidden_mode == "aic_local":
+            return expand_peaks_with_local_aic(
+                x,
+                y,
+                peaks,
+                model=model,
+                window_factor=float(self.split_factor_spin.value()),
+                asymmetry_limit=skew_limit,
+            )
+        if hidden_mode == "plateau_edges":
+            return expand_peaks_with_plateau_edges(
+                x,
+                y,
+                peaks,
+                window_factor=float(self.split_factor_spin.value()),
+            )
+        if hidden_mode == "plateau_morph":
+            return expand_peaks_with_plateau_morphology(
+                x,
+                y,
+                peaks,
+                window_factor=float(self.split_factor_spin.value()),
+            )
+        return peaks
+
     def on_detect_peaks(self) -> None:
         if self.processed is None:
             return
@@ -654,8 +729,11 @@ class SpectraMainWindow(QMainWindow):
         y = self.processed.filtered[spectrum_name]
         prominence = float(self.prominence_spin.value())
         distance = float(self.distance_spin.value())
+        model = self.model_combo.currentData()
+        skew_limit = float(self.max_skew_spin.value())
 
         peaks = detect_initial_peaks(x, y, prominence=prominence, distance=distance)
+        peaks = self._expand_hidden_peaks(x, y, peaks, model=model, skew_limit=skew_limit)
         self._set_peak_table(peaks)
 
         self.decomp_canvas.ax.clear()
@@ -667,11 +745,70 @@ class SpectraMainWindow(QMainWindow):
             s=30,
             label="Detected peaks",
         )
-        self.decomp_canvas.ax.set_title(f"Detected peaks - {spectrum_name}")
+        self.decomp_canvas.ax.set_title(f"Detected/expanded peaks - {spectrum_name}")
         self.decomp_canvas.ax.set_xlabel(self.dataset.x_name if self.dataset else "X")
         self.decomp_canvas.ax.set_ylabel("Intensity")
         self.decomp_canvas.ax.legend(loc="best")
         self.decomp_canvas.draw()
+
+    def on_detect_all_peaks(self) -> None:
+        if self.processed is None or self.dataset is None:
+            return
+
+        x = self.processed.x
+        prominence = float(self.prominence_spin.value())
+        distance = float(self.distance_spin.value())
+        model = self.model_combo.currentData()
+        skew_limit = float(self.max_skew_spin.value())
+
+        progress = QProgressDialog("Detecting peaks in all spectra...", "Cancel", 0, len(self.dataset.spectrum_names), self)
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+
+        detected: dict[str, List[Tuple[float, float, float]]] = {}
+        total_peaks = 0
+        detected_count = 0
+        error_count = 0
+        errors: List[str] = []
+
+        for idx, name in enumerate(self.dataset.spectrum_names, start=1):
+            if progress.wasCanceled():
+                break
+
+            try:
+                y = self.processed.filtered[name]
+                peaks = detect_initial_peaks(x, y, prominence=prominence, distance=distance)
+                peaks = self._expand_hidden_peaks(x, y, peaks, model=model, skew_limit=skew_limit)
+                detected[name] = peaks
+                total_peaks += len(peaks)
+                detected_count += 1
+            except Exception as exc:
+                error_count += 1
+                errors.append(f"{name}: {exc}")
+
+            progress.setValue(idx)
+            QApplication.processEvents()
+
+        progress.close()
+
+        if detected_count > 0:
+            self.detected_peaks = detected
+            self.tabs.setTabEnabled(3, True)
+            self.cluster_source_combo.blockSignals(True)
+            self.cluster_source_combo.setCurrentIndex(1)
+            self.cluster_source_combo.blockSignals(False)
+            self.on_update_clustering_plot()
+
+        msg = f"Detect all complete. Spectra processed: {detected_count}, Total peaks: {total_peaks}"
+        if error_count:
+            msg += f", Errors: {error_count}"
+        self.statusBar().showMessage(msg)
+
+        if error_count:
+            preview = "\n".join(errors[:8])
+            QMessageBox.warning(self, "Some detections failed", f"{msg}\n\n{preview}")
+        elif detected_count > 0:
+            QMessageBox.information(self, "Detection completed", msg)
 
     def on_add_peak_row(self) -> None:
         row = self.peak_table.rowCount()
@@ -723,34 +860,8 @@ class SpectraMainWindow(QMainWindow):
         skew_limit = float(self.max_skew_spin.value())
 
         progress.setLabelText("Refining hidden peaks...")
-        hidden_mode = self.hidden_peak_mode_combo.currentData()
-        if hidden_mode == "heuristic":
-            peaks = expand_peaks_for_hidden_doublets(
-                peaks,
-                x_min=float(np.min(x)),
-                x_max=float(np.max(x)),
-                split_factor=float(self.split_factor_spin.value()),
-                max_subpeaks_per_peak=2,
-            )
-            self._set_peak_table(peaks)
-        elif hidden_mode == "derivative":
-            peaks = expand_peaks_with_derivative_mode(
-                x,
-                y,
-                peaks,
-                window_factor=float(self.split_factor_spin.value()),
-            )
-            self._set_peak_table(peaks)
-        elif hidden_mode == "aic_local":
-            peaks = expand_peaks_with_local_aic(
-                x,
-                y,
-                peaks,
-                model=model,
-                window_factor=float(self.split_factor_spin.value()),
-                asymmetry_limit=skew_limit,
-            )
-            self._set_peak_table(peaks)
+        peaks = self._expand_hidden_peaks(x, y, peaks, model=model, skew_limit=skew_limit)
+        self._set_peak_table(peaks)
         progress.setValue(2)
         QApplication.processEvents()
         if progress.wasCanceled():
@@ -810,7 +921,6 @@ class SpectraMainWindow(QMainWindow):
         model = self.model_combo.currentData()
         prominence = float(self.prominence_spin.value())
         distance = float(self.distance_spin.value())
-        hidden_mode = self.hidden_peak_mode_combo.currentData()
         skew_limit = float(self.max_skew_spin.value())
 
         progress = QProgressDialog("Fitting all spectra...", "Cancel", 0, len(self.dataset.spectrum_names), self)
@@ -828,30 +938,7 @@ class SpectraMainWindow(QMainWindow):
             try:
                 y = self.processed.filtered[name]
                 initial = detect_initial_peaks(self.processed.x, y, prominence=prominence, distance=distance)
-                if hidden_mode == "heuristic":
-                    initial = expand_peaks_for_hidden_doublets(
-                        initial,
-                        x_min=float(np.min(self.processed.x)),
-                        x_max=float(np.max(self.processed.x)),
-                        split_factor=float(self.split_factor_spin.value()),
-                        max_subpeaks_per_peak=2,
-                    )
-                elif hidden_mode == "derivative":
-                    initial = expand_peaks_with_derivative_mode(
-                        self.processed.x,
-                        y,
-                        initial,
-                        window_factor=float(self.split_factor_spin.value()),
-                    )
-                elif hidden_mode == "aic_local":
-                    initial = expand_peaks_with_local_aic(
-                        self.processed.x,
-                        y,
-                        initial,
-                        model=model,
-                        window_factor=float(self.split_factor_spin.value()),
-                        asymmetry_limit=skew_limit,
-                    )
+                initial = self._expand_hidden_peaks(self.processed.x, y, initial, model=model, skew_limit=skew_limit)
                 self.fits[name] = fit_spectrum(
                     self.processed.x,
                     y,
@@ -1141,24 +1228,59 @@ class SpectraMainWindow(QMainWindow):
         summary = summary.merge(cluster_summary, on="Cluster_ID", how="left")
         return summary, cluster_summary
 
+    def _detected_peaks_summary_dataframe(self) -> pd.DataFrame:
+        rows: List[dict[str, float | int | str]] = []
+        for spectrum_name, peaks in self.detected_peaks.items():
+            for idx, (center, amplitude, width) in enumerate(peaks, start=1):
+                rows.append(
+                    {
+                        "Spectrum": str(spectrum_name),
+                        "Peak_N": int(idx),
+                        "Model": "detected",
+                        "Center": float(center),
+                        "Amplitude": float(amplitude),
+                        "Area": 0.0,
+                        "Width": float(width),
+                        "Width_Left": float(width),
+                        "Width_Right": float(width),
+                        "Skew": 0.0,
+                    }
+                )
+        return pd.DataFrame(rows)
+
     def on_update_clustering_plot(self) -> None:
-        if self.processed is None or not self.fits:
-            self._show_empty_clustering_message("Fit one or more spectra to populate the peak clustering view.")
+        if self.processed is None:
+            self._show_empty_clustering_message("Detect or fit peaks to populate the peak clustering view.")
             return
+
+        source = self.cluster_source_combo.currentData()
+        if source == "fitted":
+            if not self.fits:
+                self._show_empty_clustering_message("No fitted peaks available. Run fitting or switch source to Detected peaks.")
+                return
+            summary = peaks_summary_dataframe(self.fits)
+            selected_empty_message = "The selected spectra have not been fitted yet."
+            source_label = "fitted"
+        else:
+            if not self.detected_peaks:
+                self._show_empty_clustering_message("No detected peaks available. Run Detect all Peaks in Decomposition.")
+                return
+            summary = self._detected_peaks_summary_dataframe()
+            selected_empty_message = "The selected spectra have no detected peaks yet."
+            source_label = "detected"
 
         selected_spectra = self._selected_clustering_spectra()
         if not selected_spectra:
-            self._show_empty_clustering_message("Select one or more spectra to compare their fitted peaks.")
+            self._show_empty_clustering_message("Select one or more spectra to compare their peaks.")
             return
 
-        summary = peaks_summary_dataframe(self.fits)
         if summary.empty:
-            self._show_empty_clustering_message("No fitted peaks are available for the selected spectra.")
+            self._show_empty_clustering_message(f"No {source_label} peaks are available for the current source.")
             return
 
         summary = summary[summary["Spectrum"].isin(selected_spectra)].copy()
         if summary.empty:
-            self._show_empty_clustering_message("The selected spectra have not been fitted yet.")
+            self._show_empty_clustering_message(selected_empty_message)
             return
 
         relative_intensities = []
@@ -1235,7 +1357,7 @@ class SpectraMainWindow(QMainWindow):
         self.cluster_canvas.draw()
 
         self.statusBar().showMessage(
-            f"Clustering view updated: {len(summary)} peaks from {summary['Spectrum'].nunique()} spectra with relative intensity >= {min_relative_intensity:.4f}."
+            f"Clustering view updated ({source_label}): {len(summary)} peaks from {summary['Spectrum'].nunique()} spectra with relative intensity >= {min_relative_intensity:.4f}."
         )
     def on_export_results(self) -> None:
         if self.dataset is None or self.processed is None:

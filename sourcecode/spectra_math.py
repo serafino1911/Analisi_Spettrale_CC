@@ -531,6 +531,209 @@ def expand_peaks_with_derivative_mode(
     return refined
 
 
+def _smooth_local_signal(
+    x_local: np.ndarray,
+    y_local: np.ndarray,
+    window_fraction: float,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    smooth_window = max(5, int(x_local.size * max(float(window_fraction), 0.06)))
+    if smooth_window % 2 == 0:
+        smooth_window += 1
+    if smooth_window >= x_local.size:
+        smooth_window = x_local.size - 1 if x_local.size % 2 == 0 else x_local.size
+        smooth_window = max(5, smooth_window)
+
+    poly = min(3, max(1, smooth_window - 1))
+    y_smooth = savgol_filter(y_local, window_length=smooth_window, polyorder=poly)
+    dy = np.gradient(y_smooth, x_local)
+    d2y = np.gradient(dy, x_local)
+    return y_smooth, dy, d2y
+
+
+def _contiguous_true_segments(mask: np.ndarray) -> List[Tuple[int, int]]:
+    if mask.size == 0:
+        return []
+
+    segments: List[Tuple[int, int]] = []
+    start = -1
+    for idx, value in enumerate(mask):
+        if value and start < 0:
+            start = idx
+        elif not value and start >= 0:
+            segments.append((start, idx - 1))
+            start = -1
+    if start >= 0:
+        segments.append((start, mask.size - 1))
+    return segments
+
+
+def expand_peaks_with_plateau_edges(
+    x: np.ndarray,
+    y: np.ndarray,
+    initial_peaks: Sequence[Tuple[float, float, float]],
+    window_factor: float = 2.4,
+    min_separation_factor: float = 0.24,
+) -> List[Tuple[float, float, float]]:
+    """Split hidden peaks by detecting left/right edges of a wide local plateau."""
+    if not initial_peaks:
+        return []
+
+    x_min_global = float(np.min(x))
+    x_max_global = float(np.max(x))
+    span = max(x_max_global - x_min_global, 1e-9)
+    min_half_window = span * 0.015
+
+    refined: List[Tuple[float, float, float]] = []
+    for center, amplitude, width in initial_peaks:
+        center = float(center)
+        amplitude = max(float(amplitude), 1e-9)
+        width = max(float(width), 1e-9)
+
+        half_window = max(width * max(window_factor, 1.1), min_half_window)
+        left = center - half_window
+        right = center + half_window
+        mask = (x >= left) & (x <= right)
+
+        if int(np.sum(mask)) < 12:
+            refined.append((center, amplitude, width))
+            continue
+
+        x_local = x[mask]
+        y_local = y[mask]
+        y_smooth, dy, _ = _smooth_local_signal(x_local, y_local, window_fraction=0.2)
+
+        slope_threshold = max(float(np.percentile(np.abs(dy), 30)) * 0.55, float(np.std(dy)) * 0.12, 1e-12)
+        flat_mask = np.abs(dy) <= slope_threshold
+        segments = _contiguous_true_segments(flat_mask)
+
+        min_plateau_points = max(3, int(x_local.size * 0.08))
+        min_plateau_span = max(width * 0.30, span * 0.0015)
+
+        best_segment: Tuple[int, int] | None = None
+        best_distance = float("inf")
+        for s, e in segments:
+            if (e - s + 1) < min_plateau_points:
+                continue
+            seg_span = float(x_local[e] - x_local[s])
+            if seg_span < min_plateau_span:
+                continue
+            seg_center = 0.5 * float(x_local[s] + x_local[e])
+            dist = abs(seg_center - center)
+            if dist < best_distance:
+                best_distance = dist
+                best_segment = (s, e)
+
+        if best_segment is None:
+            refined.append((center, amplitude, width))
+            continue
+
+        s, e = best_segment
+        min_sep = max(width * max(min_separation_factor, 0.05), span * 0.002)
+        if float(x_local[e] - x_local[s]) < min_sep:
+            refined.append((center, amplitude, width))
+            continue
+
+        c1 = float(np.clip(x_local[s], x_min_global, x_max_global))
+        c2 = float(np.clip(x_local[e], x_min_global, x_max_global))
+        a1 = max(float(y_smooth[s]), 1e-9)
+        a2 = max(float(y_smooth[e]), 1e-9)
+        sub_width = max(width * 0.58, 1e-9)
+        refined.append((c1, a1, sub_width))
+        refined.append((c2, a2, sub_width))
+
+    refined.sort(key=lambda item: item[0])
+    return refined
+
+
+def expand_peaks_with_plateau_morphology(
+    x: np.ndarray,
+    y: np.ndarray,
+    initial_peaks: Sequence[Tuple[float, float, float]],
+    window_factor: float = 2.4,
+    min_separation_factor: float = 0.22,
+) -> List[Tuple[float, float, float]]:
+    """Hybrid split using derivative cues and plateau-edge evidence in local windows."""
+    if not initial_peaks:
+        return []
+
+    x_min_global = float(np.min(x))
+    x_max_global = float(np.max(x))
+    span = max(x_max_global - x_min_global, 1e-9)
+    min_half_window = span * 0.015
+
+    refined: List[Tuple[float, float, float]] = []
+    for center, amplitude, width in initial_peaks:
+        center = float(center)
+        amplitude = max(float(amplitude), 1e-9)
+        width = max(float(width), 1e-9)
+
+        half_window = max(width * max(window_factor, 1.1), min_half_window)
+        left = center - half_window
+        right = center + half_window
+        mask = (x >= left) & (x <= right)
+
+        if int(np.sum(mask)) < 12:
+            refined.append((center, amplitude, width))
+            continue
+
+        x_local = x[mask]
+        y_local = y[mask]
+        y_smooth, dy, d2y = _smooth_local_signal(x_local, y_local, window_fraction=0.16)
+
+        zero_cross_idx = np.where((dy[:-1] > 0.0) & (dy[1:] <= 0.0))[0] + 1
+        d2_prom = max(float(np.std(d2y)) * 0.2, 1e-12)
+        curvature_idx, _ = find_peaks(-d2y, prominence=d2_prom, distance=max(1, x_local.size // 12))
+
+        # Plateau-edge candidates from low-slope segment boundaries.
+        slope_threshold = max(float(np.percentile(np.abs(dy), 30)) * 0.55, float(np.std(dy)) * 0.12, 1e-12)
+        flat_mask = np.abs(dy) <= slope_threshold
+        plateau_edge_idx: List[int] = []
+        for s, e in _contiguous_true_segments(flat_mask):
+            if (e - s + 1) >= max(3, int(x_local.size * 0.08)):
+                plateau_edge_idx.append(int(s))
+                plateau_edge_idx.append(int(e))
+
+        candidate_idx = np.unique(np.concatenate([zero_cross_idx, curvature_idx, np.array(plateau_edge_idx, dtype=int)]))
+        if candidate_idx.size == 0:
+            refined.append((center, amplitude, width))
+            continue
+
+        # Favor strong points while allowing plateau boundaries to survive ranking.
+        score = np.abs(d2y[candidate_idx]) + 0.12 * np.maximum(y_smooth[candidate_idx], 0.0)
+        rank_order = np.argsort(score)[::-1]
+        ranked = candidate_idx[rank_order]
+
+        min_sep = max(width * max(min_separation_factor, 0.05), span * 0.002)
+        selected: List[int] = []
+        for idx in ranked:
+            idx = int(idx)
+            if not selected:
+                selected.append(idx)
+                continue
+            if all(abs(float(x_local[idx] - x_local[s])) >= min_sep for s in selected):
+                selected.append(idx)
+            if len(selected) >= 2:
+                break
+
+        if len(selected) >= 2:
+            selected = sorted(selected[:2], key=lambda i: x_local[i])
+            c1 = float(np.clip(x_local[selected[0]], x_min_global, x_max_global))
+            c2 = float(np.clip(x_local[selected[1]], x_min_global, x_max_global))
+            a1 = max(float(y_smooth[selected[0]]), 1e-9)
+            a2 = max(float(y_smooth[selected[1]]), 1e-9)
+            sub_width = max(width * 0.58, 1e-9)
+            refined.append((c1, a1, sub_width))
+            refined.append((c2, a2, sub_width))
+        else:
+            idx = int(selected[0])
+            c = float(np.clip(x_local[idx], x_min_global, x_max_global))
+            a = max(float(y_smooth[idx]), 1e-9)
+            refined.append((c, a, width))
+
+    refined.sort(key=lambda item: item[0])
+    return refined
+
+
 def _multi_gaussian(x: np.ndarray, *params: float) -> np.ndarray:
     y = np.zeros_like(x, dtype=float)
     for i in range(0, len(params), 3):
